@@ -1,13 +1,9 @@
 import pandas as pd
-import ads
-import operator
 import re
-import nltk
-from nltk import ngrams, word_tokenize, bigrams, trigrams
-from nltk.tokenize import word_tokenize 
-from nltk.stem import WordNetLemmatizer, PorterStemmer, SnowballStemmer
-import fnmatch
-
+from collections import Counter
+from nltk.tokenize import word_tokenize
+from nltk.util import ngrams
+from nltk.stem import WordNetLemmatizer
 
 def stopword_loader(directorypath):
     '''
@@ -24,156 +20,69 @@ def stopword_loader(directorypath):
     
     return stop_words
 
-################################################################################################################################################################################################################################################################################################################################################################################################
+lemmer = WordNetLemmatizer()
+punctuation = [',', ':', ';', '.', "'", '"', '(', ')', '’', 'SUB', 'SUP', 'sub', 'sup', 'l&gt', 'l&lt', 'lt', 'gt', 'ch']
 
-def count_words(text):
+def preprocess_text(abstract, stop_words):
     '''
-    This function takes in a tokenized text (with each word a iteration in a list) and returns the occurrence of each word and the word itself in a dictionary. It can also be used on n-grams.
+    Cleans, tokenizes, removes stopwords, and lemmatizes text
+    Done once per abstract
     '''
-    word_counts = {}
+
+    # Step 1: Remove non-letters
+    letters = re.sub("[^a-zA-Z]+", " ", abstract)
     
-    for word in text:
-        if word in word_counts:
-            word_counts[word] += 1
-        else:
-            word_counts[word] = 1
-            
-    return word_counts
+    # Step 2: Make it all lowercase.
+    lower = letters.lower()
+    
+    # Step 3: Tokenize the abstract.
+    tokens = word_tokenize(lower)
+    
+    # Step 4: Filter stopwords and punctuation
+    filtered = [
+        w for w in tokens
+        if w not in stop_words
+        and w not in punctuation
+        and w.isalpha()
+    ]
+    
+    # Step 5: Lemm the words.
+    lemmed = [lemmer.lemmatize(word) for word in filtered]
+    
+    return lemmed
 
-################################################################################################################################################################################################################################################################################################################################################################################################
+# --------------------------------------------------
+# Unified N-Gram Generator
+# --------------------------------------------------
+
+def compute_top_ngrams(tokens, n=1, top_k=10):
+    """
+    Computes top n-grams from preprocessed token list.
+    """
+    if n == 1:
+        counts = Counter(tokens)
+    else:
+        counts = Counter(ngrams(tokens, n))
+
+    return counts.most_common(top_k)
+
+# --------------------------------------------------
+# Public Functions (Backward Compatible)
+# --------------------------------------------------
 
 def topwords(abstract, directorypath):
-    '''
-    Takes in an abstract's text (a single long string) and determines the 10 most common words.
-    '''
-    stemmer = PorterStemmer()
-    lemmer = WordNetLemmatizer()
-    
-    # Step 1: Load in necessary files.
     stop_words = stopword_loader(directorypath)
-    
-    # Step 2: Remove numbers.
-    letters = re.sub("[^a-zA-Z]+", " ", abstract)
-    
-    # Step 3: Make it all lowercase.
-    lower = letters.lower()
-    
-    # Step 4: Tokenize the abstract.
-    tokenized = word_tokenize(lower)
-    
-    # Step 5: Remove punctuation and stop words.
-    punctuation = [',', ':', ';', '.', "'", '"', '(', ')', '’', 'SUB', 'SUP', 'sub', 'sup', 'l&gt', 'l&lt', 'lt', 'gt', 'ch']
-    filtered = [w for w in tokenized if not w in stop_words]
-    filtered = [w for w in filtered if not w in punctuation]
-    
-    # Step 6: Lemm the words.
-    lemmed = []
-    for word in filtered:
-        lemmed_word = lemmer.lemmatize(word)
-        lemmed.append(lemmed_word)
-        
-    # Step 7: Count the words !
-    counts = count_words(lemmed)
-    
-    # Step 8: Order the word counts from highest to lowest.
-    sort = sorted(counts.items(), key = operator.itemgetter(1), reverse = True)
-    
-    # Step 9: Grabbing the top 10.
-    top10 = sort[0:10]
-    
-    return top10
+    tokens = preprocess_text(abstract, stop_words)
+    return compute_top_ngrams(tokens, n=1)
 
-################################################################################################################################################################################################################################################################################################################################################################################################
 
 def topbigrams(abstract, directorypath):
-    '''
-    Takes in an abstract's text (a single long string) and determines the 10 most common bigrams.
-    '''
-    stemmer = PorterStemmer()
-    lemmer = WordNetLemmatizer()
-    
-    # Step 1: Load in necessary files.
     stop_words = stopword_loader(directorypath)
-    
-    # Step 2: Remove numbers
-    letters = re.sub("[^a-zA-Z]+", " ", abstract)
-    
-    # Step 3: Make it all lowercase.
-    lower = letters.lower()
-    
-    # Step 3: Tokenize the abstract.
-    tokenized = word_tokenize(lower)
-    
-    # Step 4: Remove punctuation and stop words.
-    punctuation = [',', ':', ';', '.', "'", '"', '(', ')', '’', 'SUB', 'SUP', 'sub', 'sup', 'l&gt', 'l&lt', 'lt', 'gt', 'ch']
-    filtered = [w for w in tokenized if not w in stop_words]
-    filtered = [w for w in filtered if not w in punctuation]
-    
-    # Step 5: Lemm the words.
-    lemmed = []
-    for word in filtered:
-        lemmed_word = lemmer.lemmatize(word)
-        lemmed.append(lemmed_word)
-        
-    # Step 6: Split into bigrams
-    bigramss = list(bigrams(lemmed))
-    
-    # Step 7: Count the words !
-    counts = count_words(bigramss)
-    
-    # Step 8: Order the word counts from highest to lowest.
-    sort = sorted(counts.items(), key = operator.itemgetter(1), reverse = True)
-    
-    # Step 9: Grabbing the top 10.
-    top10 = sort[0:10]
-    
-    return top10
+    tokens = preprocess_text(abstract, stop_words)
+    return compute_top_ngrams(tokens, n=2)
 
-################################################################################################################################################################################################################################################################################################################################################################################################
 
 def toptrigrams(abstract, directorypath):
-    '''
-    Takes in an abstract's text (a single long string) and determines the 10 most common bigrams.
-    '''
-    
-    stemmer = PorterStemmer()
-    lemmer = WordNetLemmatizer()
-    
-    # Step 1: Load in necessary files.
     stop_words = stopword_loader(directorypath)
-    
-    # Step 2: Remove numbers
-    letters = re.sub("[^a-zA-Z]+", " ", abstract)
-    
-    # Step 3: Make it all lowercase.
-    lower = letters.lower()
-    
-    # Step 3: Tokenize the abstract.
-    tokenized = word_tokenize(lower)
-    
-    # Step 4: Remove punctuation and stop words.
-    punctuation = [',', ':', ';', '.', "'", '"', '(', ')', '’', 'SUB', 'SUP', 'sub', 'sup', 'l&gt', 'l&lt', 'lt', 'gt', 'ch']
-    filtered = [w for w in tokenized if not w in stop_words]
-    filtered = [w for w in filtered if not w in punctuation]
-    
-    # Step 5: Lemm the words.
-    lemmed = []
-    for word in filtered:
-        lemmed_word = lemmer.lemmatize(word)
-        lemmed.append(lemmed_word)
-        
-    # Step 6: Split into bigrams
-    trigramss = list(trigrams(filtered))
-    
-    # Step 7: Count the words !
-    counts = count_words(trigramss)
-    
-    # Step 8: Order the word counts from highest to lowest.
-    sort = sorted(counts.items(), key = operator.itemgetter(1), reverse = True)
-    
-    # Step 9: Grabbing the top 10.
-    top10 = sort[0:10]
-    
-    return top10
-
-################################################################################################################################################################################################################################################################################################################################################################################################
+    tokens = preprocess_text(abstract, stop_words)
+    return compute_top_ngrams(tokens, n=3)

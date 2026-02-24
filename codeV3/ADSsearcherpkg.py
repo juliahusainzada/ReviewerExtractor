@@ -3,17 +3,25 @@ from urllib.parse import urlencode
 import numpy as np
 import TextAnalysis as TA
 import itertools
-from prompt_toolkit.shortcuts import prompt
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from LlamaModelV2 import generate_expertise, get_groq, string_to_list
-from rapidfuzz import process, fuzz
+# from LlamaModelV2 import generate_expertise, get_groq, string_to_list
 import time
 
 import pandas as pd
 
-##############################    TEST Version August, 20, 2025 ####################
+'''
+API parameters:
+(
+    name=None, 
+    institution=None, 
+    year=None, 
+    refereed='property:notrefereed OR property:refereed', 
+    token=None, 
+    stop_dir=None, 
+    second_auth=False, 
+    groq_analysis=False, 
+    deep_dive=False
+)
+'''
 
 def do_search(auth_name, inst, t, q):
     """
@@ -21,22 +29,27 @@ def do_search(auth_name, inst, t, q):
     
     Returns a dataframe with the results of the search for a given author or institution.
     """
+    # ends an HTTP GET to the ADS search endpoint using the query string q and authenticates with a Bearer token t
     results = requests.get(
         "https://api.adsabs.harvard.edu/v1/search/query?{}".format(q),
         headers={'Authorization': 'Bearer ' + t}
     )
+
+    # Takes results as json
     json_data = results.json()
     if "response" not in json_data:
         print("ADS API error:", json_data)
+        # Turns json into a pandas df
         return pd.DataFrame()
-    data = results.json()["response"]["docs"]
-    pdates = [d['pubdate'] for d in data]
-    affiliations = [d['aff'][0] for d in data]
+    
+    data = json_data["response"]["docs"] # docs contains each paper 
+    pdates = [d['pubdate'] for d in data] # for paper in data, get pubdate 
+    affiliations = [d['aff'][0] for d in data] # why only first?
     bibcodes = [d['bibcode'] for d in data]
     f_auth = [d['first_author'] for d in data]
     keysw = [d.get('keyword', []) for d in data]
-    titles = [d.get('title', '') for d in data]
-    abstracts = [d.get('abstract', '') for d in data]
+    titles = [d.get('title', '') for d in data] # if not present, ''
+    abstracts = [d.get('abstract', '') for d in data] # if not present, ''
     ids = [d.get('identifier', []) for d in data]
 
     df = pd.DataFrame({
@@ -58,7 +71,7 @@ def do_search(auth_name, inst, t, q):
     return df
 
 def format_year(year):
-    if isinstance(year, (int, np.integer)):
+    if isinstance(year, (int, float, np.integer)):
         startd = str(year - 1)
         endd = str(year + 4)
         return f'[{startd} TO {endd}]'
@@ -78,10 +91,6 @@ def format_year(year):
             return year
     else:
         raise ValueError("Year must be an integer, float, or a string representing a year or a year range.")
-
-
-
-
 
 def ads_search(name=None, institution=None, year=None, refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False):
@@ -114,21 +123,11 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
 
     encoded_query = urlencode({
         "q": query,
-        "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
-        "fq": "database:astronomy," + str(refereed),
+        "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier", # fields to return 
+        "fq": "database:astronomy," + str(refereed), # so refereed is required, but after
         "rows": 3000,
         "sort": "date desc"
     })
-    
-    try:
-        print('I am now querying ADS.\n')
-        results = requests.get(
-            "https://api.adsabs.harvard.edu/v1/search/query?{}".format(encoded_query),
-            headers={'Authorization': 'Bearer ' + token}
-        )
-        data = results.json()["response"]["docs"]
-    except:
-        print('Oops, something went wrong.\n')
 
     df = do_search(name, institution, token, encoded_query)
 
@@ -165,7 +164,7 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
                 data_author = ads_search(
                     name=author,
                     institution=None,
-                    year='[2000 TO 2030]',
+                    year='[2000 TO 2030]', # is this intentional? should it be the same as the original search?
                     token=token,
                     stop_dir=stop_dir,
                     second_auth=second_auth,
@@ -246,7 +245,7 @@ def merge(df):
     merged = df.groupby('Input Author').aggregate({'Input Institution': ', '.join,
                                                  'First Author': ', '.join,
                                                  'Bibcode': ', '.join,
-                                                 'Title': lambda x: list(itertools.chain.from_iterable(x)), 
+                                                 'Title': lambda x: list(itertools.chain.from_iterable(x)), # become one big list
                                                  'Publication Date': ', '.join,
                                                  'Keywords': lambda x: list(itertools.chain.from_iterable(x)), # <- Fix for Keywords
                                                  'Affiliations': ', '.join,
@@ -262,29 +261,19 @@ def n_grams(df, directorypath):
     
     Returns the dataframe including the top 10 words, bigrams, and trigrams.
     """
-    top10Dict = {'Top 10 Words': [],
-                 'Top 10 Bigrams': [],
-                 'Top 10 Trigrams': []}
+    top_words, top_bigrams, top_trigrams = [], [], []
 
-    for i in df.values:
-        abstracts = i[8]
-        top10words = TA.topwords(abstracts, directorypath)
-        top10bigrams = TA.topbigrams(abstracts, directorypath)
-        top10trigrams = [( " ".join(trigram), count) for trigram, count in list(TA.toptrigrams(abstracts, directorypath))]
-        top10bigrams = [( " ".join(bigram), count) for bigram, count in list(TA.topbigrams(abstracts, directorypath))]
-        top10Dict['Top 10 Words'].append(top10words)
-        top10Dict['Top 10 Bigrams'].append(top10bigrams)
-        top10Dict['Top 10 Trigrams'].append(top10trigrams)
+    for abstract in df['Abstract']:
+        tokens = TA.tokenize_abstract(abstract, stop_words)
+        top_words.append(TA.compute_top_ngrams(tokens, n=1))
+        top_bigrams.append(TA.compute_top_ngrams(tokens, n=2))
+        top_trigrams.append(TA.compute_top_ngrams(tokens, n=3))
 
-    top10Df = df
-    top10Df['Top 10 Words'] = top10Dict['Top 10 Words']
-    top10Df['Top 10 Bigrams'] = top10Dict['Top 10 Bigrams']
-    top10Df['Top 10 Trigrams'] = top10Dict['Top 10 Trigrams']
-
-    top10Df = top10Df[['Input Author', 'Input Institution', 'First Author', 'Bibcode', 'Title', 'Publication Date',
-                       'Keywords', 'Affiliations', 'Abstract', 'Identifier', 'Top 10 Words', 'Top 10 Bigrams',
-                       'Top 10 Trigrams', 'Data Type']]
-    return top10Df
+    df = df.copy()
+    df['Top 10 Words'] = top_words
+    df['Top 10 Bigrams'] = top_bigrams
+    df['Top 10 Trigrams'] = top_trigrams
+    return df
 
 
 def get_user_input(dataframe):
@@ -435,5 +424,3 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
         print("Groq analysis complete.")
     
     return final_df
-
-
