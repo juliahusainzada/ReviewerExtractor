@@ -237,9 +237,11 @@ def merge(df):
     """
     df['Publication Date'] = df['Publication Date'].astype(str)
     df['Abstract'] = df['Abstract'].astype(str)
+
     df['Keywords'] = df['Keywords'].apply(lambda keywords: keywords if keywords else []) # <- Fix for Keywords
     df['Title'] = df['Title'].apply(lambda titles: titles if titles else []) 
     df['Identifier'] = df['Identifier'].apply(lambda ids: ids if ids else []) 
+    
     df.fillna('None', inplace=True)
 
     merged = df.groupby('Input Author').aggregate({'Input Institution': ', '.join,
@@ -263,8 +265,10 @@ def n_grams(df, directorypath):
     """
     top_words, top_bigrams, top_trigrams = [], [], []
 
+    stop_words = TA.stopword_loader(directorypath)
+
     for abstract in df['Abstract']:
-        tokens = TA.tokenize_abstract(abstract, stop_words)
+        tokens = TA.preprocess_text(abstract, stop_words)
         top_words.append(TA.compute_top_ngrams(tokens, n=1))
         top_bigrams.append(TA.compute_top_ngrams(tokens, n=2))
         top_trigrams.append(TA.compute_top_ngrams(tokens, n=3))
