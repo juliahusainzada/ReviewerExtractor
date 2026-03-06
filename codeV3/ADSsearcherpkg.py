@@ -22,6 +22,13 @@ API parameters:
     deep_dive=False
 )
 '''
+ADS_RATE_LIMIT = 0.2
+BATCH_SIZE = 25
+
+def chunk_list(lst, size):
+    """Split a list into chunks of a given size."""
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
 
 def do_search(auth_name, inst, t, q):
     """
@@ -30,6 +37,8 @@ def do_search(auth_name, inst, t, q):
     Returns a dataframe with the results of the search for a given author or institution.
     """
     # ends an HTTP GET to the ADS search endpoint using the query string q and authenticates with a Bearer token t
+    time.sleep(0.2)
+    
     results = requests.get(
         "https://api.adsabs.harvard.edu/v1/search/query?{}".format(q),
         headers={'Authorization': 'Bearer ' + t}
@@ -92,102 +101,126 @@ def format_year(year):
     else:
         raise ValueError("Year must be an integer, float, or a string representing a year or a year range.")
 
+# Global dictionary to track authors and their institutions
+# { "Author Name": {"Inst 1", "Inst 2"} }
+AUTHOR_MAP = {}
 def ads_search(name=None, institution=None, year=None, refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False):
     """
     Builds a query for ADS search based on name, institution, year, second_author. Merges all results and optionally runs groq
     subtopics analysis on the results. 
     
+    Builds with a Global Cache to prevent redundant author lookups.
+
     Returns a dictionary with all authors and corresponding publications that match the search query.
     """
-    final_df = pd.DataFrame()
+    global AUTHOR_MAP
+
+    # Cache check (skipping API call if author is already in cache and institution is not specified)
+    if name and not institution:
+        if name in AUTHOR_MAP:
+            # We've seen them! We skip the API call but record the new institution
+            # Note: We'll pass the 'current_inst' via a local variable or logic
+            print(f"> Skipping API for {name}: Already processed.")
+            return pd.DataFrame()
+
     query_parts = []
+
     if name:
         if second_auth:
-            query_parts.append(f'(author:"^{name}" OR pos(author:"{name}",2))')
+            query_parts.append(f'(first_author:"{name}" OR pos(author:"{name}",2))')
         else:
-            query_parts.append(f'author:"^{name}"')
+            query_parts.append(f'first_author:"^{name}"')
     if institution:
         query_parts.append(f'pos(institution:"{institution}",1)')
     if year:
         years = format_year(year)
         query_parts.append(f'pubdate:{years}')
     
-
     if not query_parts:
         print("You did not give me enough to search on, please try again.")
-        return final_df
+        return pd.DataFrame()
     
     query = " AND ".join(query_parts)
-    print(f"I will search for papers matching the following criteria:\n{query}\n")
 
+    # Deep dive search
+    if institution and deep_dive:
+        print(f"Step 1: Scouting author names for {institution}...")
+        
+        # Light search to only get author names
+        discovery_params = {
+            "q": query,
+            "fl": "first_author",
+            "fq": "database:astronomy," + str(refereed),
+            "rows": 3000,
+        }
+
+        res = requests.get(
+            f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}",
+            headers={'Authorization': 'Bearer ' + token}
+        ).json()
+
+        if "response" in res and res["response"]["docs"]:
+            unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
+
+            print(f"Step 2: Deep Diving {len(unique_authors)} unique authors...")
+            author_results = []
+
+            for author_batch in chunk_list(list(unique_authors), BATCH_SIZE):
+                time.sleep(ADS_RATE_LIMIT)
+
+                author_query = " OR ".join([f'first_author:"{a}"' for a in author_batch])
+                query_parts = [f"({author_query})"]
+
+                if year:
+                    years = format_year(year)
+                    query_parts.append(f'pubdate:{years}')
+
+                batch_query = " AND ".join(query_parts)
+
+                encoded_query = urlencode({
+                    "q": batch_query,
+                    "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
+                    "fq": "database:astronomy," + str(refereed),
+                    "rows": 3000,
+                    "sort": "date desc"
+                })
+
+                df_batch = do_search(None, institution, token, encoded_query)
+                if not df_batch.empty:
+                    author_results.append(df_batch)
+            
+            # AFTER all batches:
+            if author_results:
+                full_df = pd.concat(author_results, ignore_index=True)
+                merged_df = merge(full_df)  # <-- merge once for all authors
+                return merged_df
+            else:
+                return pd.DataFrame()
+            
+    # Standard search (if not deep dive)
     encoded_query = urlencode({
         "q": query,
-        "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier", # fields to return 
-        "fq": "database:astronomy," + str(refereed), # so refereed is required, but after
+        "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
+        "fq": "database:astronomy," + str(refereed),
         "rows": 3000,
         "sort": "date desc"
     })
 
     df = do_search(name, institution, token, encoded_query)
 
-    if df.empty and institution:
-        print('DataFrame is empty! Trying alternative search using affiliation instead of institution.')
-        new_query_parts = []
-        for part in query_parts:
-            # Replace the institution clause with an affiliation clause
-            if f'pos(institution:"{institution}",1)' in part:
-                new_query_parts.append(f'pos(aff:"{institution}",1)')
-            else:
-                new_query_parts.append(part)
-        new_query = " AND ".join(new_query_parts)
-        print(f"Alternative query:\n{new_query}\n")
-        encoded_query = urlencode({
-            "q": new_query,
-            "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword,identifier",
-            "fq": "database:astronomy," + str(refereed),
-            "rows": 3000,
-            "sort": "date desc"
-        })
-        df = do_search(name, institution, token, encoded_query)
-        if df.empty:
-            print('DataFrame is empty! PLEASE CHECK THE ADS CATALOG OF INSTITUTIONS FOR THE CORRECT INPUT')
-
-            
-    if institution and deep_dive:
-        if not df.empty:
-            unique_authors = df["Input Author"].unique().tolist()
-            print(f"Unique authors from institution search: {unique_authors}")
-            author_results = []
-            for author in unique_authors:
-                print(f"Re-running ADS search for author: {author} without institutional constraint")
-                data_author = ads_search(
-                    name=author,
-                    institution=None,
-                    year='[2000 TO 2030]', # is this intentional? should it be the same as the original search?
-                    token=token,
-                    stop_dir=stop_dir,
-                    second_auth=second_auth,
-                    refereed=refereed,
-                    groq_analysis=False,
-                    deep_dive=False  
-                )
-                if not data_author.empty:
-                    author_results.append(data_author)
-            if not author_results:
-                print("No author-specific ADS results found after re-running search.")
-                return pd.DataFrame()
-            df = pd.concat(author_results, ignore_index=True)
-
     if not df.empty:
         data2 = merge(df)
         data3 = data_type(data2)
         data4 = n_grams(data3, stop_dir)
-        if groq_analysis:
-            print("Running Groq subtopics analysis on ADS results...")
-            data4 = generate_expertise(data4, groq_client=get_groq())
-            print("Groq analysis complete.")
+
+        # if groq_analysis:
+        #    print("Running Groq subtopics analysis on ADS results...")
+        #    data4 = generate_expertise(data4, groq_client=get_groq())
+        #    print("Groq analysis complete.")
+        
         return data4
+    
     else:
         print("No results found.")
         dummy_data = {
@@ -195,19 +228,18 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
             'Input Institution': institution if institution else "None",
             'First Author': "None",
             'Bibcode': "None",
-            'Title': "None",
+            'Title': [],
             'Publication Date': "None",
-            'Keywords': "None",
+            'Keywords': [],
             'Affiliations': "None",
             'Abstract': "None",
-            'Identifier': "None",
+            'Identifier': [],
             'Data Type': "None",
             'Top 10 Words': "None",
             'Top 10 Bigrams': "None",
             'Top 10 Trigrams': "None"
         }
         return pd.DataFrame([dummy_data])
-
 
 def data_type(df):
     """
@@ -358,16 +390,20 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
     """
     Runs ADS search based on user's search type (name or institution).
     
-    For institution searches, after the initial search we extract unique authors from the results
-    and re-run ADS search for each author with the institution filter.
-    Finally, if Groq analysis is requested, it is applied on the aggregated results.
+    Ensures authors found across multiple institutions are merged into a single row
+    with an aggregated institution list.
     """
+    global AUTHOR_MAP
+    AUTHOR_MAP = {} # Used for institution deep dives
+    
     dataframe = pd.read_csv(filename)
     final_df = pd.DataFrame()
     count = 0
     search_params = get_user_input(dataframe)
+
     print("Searching for results...")
     search_type = search_params['search_type']
+
     # Name search logic, including second author logic
     if search_type == 'name':
         for i in range(len(dataframe)):
@@ -386,10 +422,7 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
             )
             search_identifier = f"name: {name} (including {'second' if second_auth else 'only first'} author)"
             if not data1.empty:
-                data2 = merge(data1)
-                data3 = data_type(data2)
-                data4 = n_grams(data3, stop_dir)
-                final_df = pd.concat([final_df, data4], ignore_index=True)
+                final_df = pd.concat([final_df, data1], ignore_index=True)
                 count += 1
                 print(f"Completed {count} searches - Processed {search_identifier}")
             else:
@@ -399,14 +432,14 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
         for i in range(len(dataframe)):
             inst = dataframe[search_params['institution_column']][i]
             print(f"Processing institution: {inst}")
-            second_auth = search_params.get('second_author', False)
+
             data = ads_search(
                 name=None,
                 institution=inst,
                 year=search_params.get('year_range', False),
                 token=token,
                 stop_dir=stop_dir,
-                second_auth=second_auth,
+                second_auth=search_params.get('second_author', False),
                 groq_analysis=search_params.get('groq_analysis', False),
                 deep_dive=search_params.get('deep_dive', False),
                 refereed=search_params.get('refereed')
@@ -415,16 +448,29 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
                 inst_results.append(data)
             else:
                 print(f"No records found for institution: {inst}")
+        
         if inst_results:
             final_df = pd.concat(inst_results, ignore_index=True)
             print(f"Processed institution search with deep_dive={search_params.get('deep_dive', False)}")
         else:
             print("No records found for any institution search.")
     
-    # Run groq analysis on all search results 
-    if search_params.get('groq_analysis', False) and not final_df.empty:
-        print("Running Groq subtopics analysis on aggregated ADS results...")
-        final_df = generate_expertise(final_df, groq_client=get_groq())
-        print("Groq analysis complete.")
-    
-    return final_df
+        # Cleanup 
+        if search_type == 'institution' and not final_df.empty:
+            print("Updating final institution mappings...")
+            for index, row in final_df.iterrows():
+                author_name = row['Input Author']
+                if author_name in AUTHOR_MAP:
+                    # We turn the list/set into a clean, sorted string: "NYU, SJSU"
+                    all_insts = ", ".join(sorted(AUTHOR_MAP[author_name]))
+                    
+                    # Overwrite the old single institution with the full list
+                    final_df.at[index, 'Input Institution'] = all_insts
+        
+        # Run groq analysis on all search results 
+        # if search_params.get('groq_analysis', False) and not final_df.empty:
+        #    print("Running Groq subtopics analysis on aggregated ADS results...")
+        #    final_df = generate_expertise(final_df, groq_client=get_groq())
+        #    print("Groq analysis complete.")
+        
+        return final_df
