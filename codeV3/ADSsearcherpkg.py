@@ -103,7 +103,7 @@ def format_year(year):
 
 # Global dictionary to track authors and their institutions
 # { "Author Name": {"Inst 1", "Inst 2"} }
-AUTHOR_MAP = {}
+AUTHOR_MAP = set()
 def ads_search(name=None, institution=None, year=None, refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False):
     """
@@ -116,17 +116,9 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
     """
     global AUTHOR_MAP
 
-    # Cache check (skipping API call if author is already in cache and institution is not specified)
-    if name and not institution:
-        if name in AUTHOR_MAP:
-            # We've seen them! We skip the API call but record the new institution
-            # Note: We'll pass the 'current_inst' via a local variable or logic
-            print(f"> Skipping API for {name}: Already processed.")
-            return pd.DataFrame()
-
     query_parts = []
 
-    if name:
+    if name and not deep_dive:
         if second_auth:
             query_parts.append(f'(first_author:"{name}" OR pos(author:"{name}",2))')
         else:
@@ -162,6 +154,7 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
 
         if "response" in res and res["response"]["docs"]:
             unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
+            unique_authors = [a for a in unique_authors if a not in AUTHOR_MAP]
 
             print(f"Step 2: Deep Diving {len(unique_authors)} unique authors...")
             author_results = []
@@ -187,8 +180,13 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
                 })
 
                 df_batch = do_search(None, institution, token, encoded_query)
+                # df_batch = df_batch[df_batch['First Author'].isin(author_batch)]
+                df_batch['Input Author'] = df_batch['First Author']
+                
                 if not df_batch.empty:
                     author_results.append(df_batch)
+                
+                AUTHOR_MAP.update(author_batch)
             
             # AFTER all batches:
             if author_results:
@@ -276,7 +274,7 @@ def merge(df):
     
     df.fillna('None', inplace=True)
 
-    merged = df.groupby('Input Author').aggregate({'Input Institution': ', '.join,
+    merged = df.groupby('Input Author').aggregate({'Input Institution': lambda x: ", ".join(sorted(set(x))),
                                                  'First Author': ', '.join,
                                                  'Bibcode': ', '.join,
                                                  'Title': lambda x: list(itertools.chain.from_iterable(x)), # become one big list
@@ -394,7 +392,7 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
     with an aggregated institution list.
     """
     global AUTHOR_MAP
-    AUTHOR_MAP = {} # Used for institution deep dives
+    AUTHOR_MAP = set() # Used for institution deep dives
     
     dataframe = pd.read_csv(filename)
     final_df = pd.DataFrame()
@@ -450,22 +448,11 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
                 print(f"No records found for institution: {inst}")
         
         if inst_results:
-            final_df = pd.concat(inst_results, ignore_index=True)
+            final_df = pd.concat(batch_dfs, ignore_index=True)
+            final_df = merge(final_df)  # merge all papers per Input Author
             print(f"Processed institution search with deep_dive={search_params.get('deep_dive', False)}")
         else:
             print("No records found for any institution search.")
-    
-        # Cleanup 
-        if search_type == 'institution' and not final_df.empty:
-            print("Updating final institution mappings...")
-            for index, row in final_df.iterrows():
-                author_name = row['Input Author']
-                if author_name in AUTHOR_MAP:
-                    # We turn the list/set into a clean, sorted string: "NYU, SJSU"
-                    all_insts = ", ".join(sorted(AUTHOR_MAP[author_name]))
-                    
-                    # Overwrite the old single institution with the full list
-                    final_df.at[index, 'Input Institution'] = all_insts
         
         # Run groq analysis on all search results 
         # if search_params.get('groq_analysis', False) and not final_df.empty:
