@@ -94,7 +94,7 @@ def format_year(year):
 # Global set to track authors
 AUTHOR_MAP = set()
 def ads_search(name=None, institution=None, year=None, refereed='property:notrefereed OR property:refereed', \
-               token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False):
+               token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False, early_career=None):
     """
     Builds a query for ADS search based on name, institution, year, second_author. Merges all results and optionally runs groq
     subtopics analysis on the results. 
@@ -146,7 +146,6 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
             unique_authors = [a for a in unique_authors if a not in AUTHOR_MAP]
 
             print(f"Step 2: Deep Diving {len(unique_authors)} unique authors...")
-            print(unique_authors)
             author_results = []
 
             for author_batch in chunk_list(list(unique_authors), BATCH_SIZE):
@@ -182,7 +181,13 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
                 full_df = pd.concat(author_results, ignore_index=True)
                 merged_df = merge(full_df)  # <-- merge once for all authors
                 merged_df = data_type(merged_df)
+                merged_df = early_career_flag(merged_df)
+
+                if early_career is not None:
+                    merged_df = merged_df[merged_df['Early Career'] == early_career]
+                
                 merged_df = n_grams(merged_df, stop_dir)
+
                 return merged_df
             else:
                 return pd.DataFrame()
@@ -201,9 +206,14 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
     if not df.empty:
         data2 = merge(df)
         data3 = data_type(data2)
-        data4 = n_grams(data3, stop_dir)
+        data4 = early_career_flag(data3)
+
+        if early_career is not None:
+            data5 = data4[data4['Early Career'] == early_career]
         
-        return data4
+        data6 = n_grams(data5, stop_dir)
+
+        return data6
     
     else:
         print("No results found.")
@@ -295,6 +305,43 @@ def n_grams(df, directorypath):
     df['Top 10 Trigrams'] = top_trigrams
     return df
 
+def early_career_flag(df, cutoff_year=2010):
+    """
+    Flags whether an author is early career.
+
+    Early career = no publication prior to cutoff_year.
+    Uses the merged Publication Date column.
+    """
+
+    early_flags = []
+
+    for dates in df['Publication Date']:
+        try:
+            # split comma-separated pubdates
+            date_list = [d.strip() for d in dates.split(",")]
+
+            # extract year from 'YYYY-MM' or 'YYYY'
+            years = []
+            for d in date_list:
+                if len(d) >= 4:
+                    year = int(d[:4])
+                    years.append(year)
+
+            if not years:
+                early_flags.append(False)
+                continue
+
+            earliest_year = min(years)
+
+            # early career condition
+            early_flags.append(earliest_year >= cutoff_year)
+
+        except Exception:
+            early_flags.append(False)
+
+    df = df.copy()
+    df['Early Career'] = early_flags
+    return df
 
 def get_user_input(dataframe):
     """
@@ -355,7 +402,14 @@ def get_user_input(dataframe):
             print("Invalid choice. Please enter 'y' or 'n'.")
         search_params['second_author'] = (include_second == "y")
         
+    print("\nNOTE:")
+    print("Early-career classification depends on the publication history returned by ADS.")
+    print("If the selected year range does not include years prior to 2010, the system")
+    print("cannot determine whether an author had earlier publications.")
+    print("This may cause senior researchers to be incorrectly flagged as early-career.\n")
+
     year_range = input("Enter the year range for your search (format: [YYYY TO YYYY] or a 4-digit year, default: [2003 TO 2030]): ").strip() or "[2003 TO 2030]"
+
     search_params['year_range'] = year_range
     
     ref_input = input("Do you want refereed papers only? (y/n) [y]: ").strip().lower() or "y"
@@ -365,8 +419,13 @@ def get_user_input(dataframe):
         search_params['refereed'] = "property:notrefereed OR property:refereed"
     
     
-    run_groq = input("Do you want to run Groq subtopics analysis on the ADS results? (y/n) [n]: ").strip().lower() or "n"
-    search_params['groq_analysis'] = (run_groq == "y")
+    early_input = input("Do you want to filter for early-career researchers only? (y/n) [n]: ").strip().lower() or "n"
+
+    if early_input == "y":
+        search_params['early_career'] = True
+    else:
+        search_params['early_career'] = None  # don't filter
+        
     return search_params
 
 
@@ -448,7 +507,13 @@ def run_file_search(filename,  token, stop_dir,year=None, second_auth=False,
             final_df = pd.concat(inst_results, ignore_index=True)
             final_df = merge(final_df)  # Merge authors across institutions
             final_df = data_type(final_df)
+            final_df = early_career_flag(final_df)
+
+            if early_career is not None:
+                final_df = final_df[final_df['Early Career'] == early_career]
+            
             final_df = n_grams(final_df, stop_dir)  # Recompute n-grams on merged data
+
             print(f"Processed institution search with deep_dive={search_params.get('deep_dive', False)}")
         else:
             print("No records found for any institution search.")
