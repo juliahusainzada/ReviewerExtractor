@@ -359,20 +359,17 @@ def get_user_input(dataframe):
 
     # Helper: Handles Yes/No/None 
     def ask_yes_no(prompt, default="n"):
-        if default is None:
-            hint = "(y/n) [Press Enter for None]"
-        else:
-            hint = f"(y/n) [Default: {default}]" 
+        hint = f"(y/n) [Default: {default}]" 
         
         choice = input(f"{prompt} {hint}: ").strip().lower()
 
         if not choice:
             return default
     
-        if choice == 'y': return True
-        if choice == 'n': return False 
-
-        return default
+        if choice == 'y': 
+            return True
+        else:
+            return False
     
     # Helper: Matches user string to actual dataframe columns (case-insensitive)
     def find_column(prompt, default_col):
@@ -400,26 +397,37 @@ def get_user_input(dataframe):
     }
     
     # 1. Select search type
-    print("\nWhat type of search do you want to conduct?")
+    print("Available search types:")
     for key, description in available_search_types.items():
         print(f"-Enter '{key}' for {description}")
+
+    while True:
+        try:
+            search_type = input("\nEnter search type: ('name' or 'institution'):\n").lower()
+            if search_type in available_search_types:
+                break
+            print("Invalid search type. Please enter 'name' or 'institution'.")
+        except NameError:
+            print("Error getting input. Please try again.")
     
-    search_type = ""
-    while search_type not in available_search_types:
-        search_type = input("\nEnter search type: ").lower().strip()
+    print(f"✓ Selected '{search_type}' search.")
     
     # 2. Create search_params dict to hold parameters for the ADS search query
     search_params = {'search_type': search_type}
-    print(f"\nAvailable columns: {', '.join(dataframe.columns)}")
+    print(f"\nThese are the available columns from your dataset: {', '.join(dataframe.columns)}")
     
     if search_type == 'name':
         search_params['name_column'] = find_column("Enter the name of the column that contains the data for 'name' search: ", "Name")
+        print(f"✓ Selected '{search_params['name_column']}' column.")
 
     else:
         search_params['institution_column'] = find_column("Enter the name of the column that contains the data for 'institution' search: ", "Name")
+        print(f"✓ Selected '{search_params['institution_column']}' column.")
         search_params['deep_dive'] = ask_yes_no("Do you want to run a deep dive search (re-run for each author) for institution search?", default="n")
+        print(f"✓ Selected '{search_params['deep_dive']}' for deep dive.")
 
     search_params['second_author'] = ask_yes_no("Do you want to include search by second author? (y/n) [n]: ", default="n") 
+    print(f"✓ Selected '{search_params['second_author']}' for second author search.")
     
     # 3. Year and filter options
     print("\nNOTE:")
@@ -430,12 +438,15 @@ def get_user_input(dataframe):
 
     year_range = input("Enter the year range for your search (format: [YYYY TO YYYY] or a 4-digit year, default: [2003 TO 2030]): ").strip() or "[2003 TO 2030]"
     search_params['year_range'] = year_range
+    print(f"✓ Selected '{search_params['year_range']}' for the year range.")
     
     is_refereed = ask_yes_no("Do you want refereed papers only? (y/n) [y]:", default="y")
     search_params['refereed'] = "property:refereed" if is_refereed else "property:notrefereed OR property:refereed"
-    
-    search_params['early_career'] = ask_yes_no("Filter for early-career researchers only?", default=None)    
-    
+    print(f"✓ Selected '{search_params['refereed']}' for refereed papers.")
+
+    search_params['early_career_filter'] = ask_yes_no("Filter results for early-career researchers ONLY?")
+    print(f"✓ Selected '{"Yes" if search_params['early_career_filter'] == True else "No"}' for early-career researchers.")   
+
     return search_params
 
 def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
@@ -456,6 +467,11 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     search_params = get_user_input(raw_data)
     
     all_results = []
+
+    # Map the boolean choice
+    # If filter is False (user said 'n'), we pass None
+    ec_filter_val = True if search_params['early_career_filter'] else None
+
     search_type = search_params['search_type']
 
     # Identify which column we are iterating over
@@ -478,7 +494,7 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
             'stop_dir': stop_dir,
             'second_auth': search_params['second_author'],
             'refereed': search_params['refereed'],
-            'early_career': search_params['early_career'],  # Pass the True/False/None value
+            'early_career': ec_filter_val,
             'deep_dive': search_params.get('deep_dive', False)
         }
 
@@ -503,7 +519,7 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
         return pd.DataFrame()
 
     final_df = pd.concat(all_results, ignore_index=True)
-    final_df = process_results(final_df, stop_dir, search_params['early_career'])
+    final_df = process_results(final_df, stop_dir, ec_filter_val)
         
     print(f"Search complete. {len(final_df)} unique author records found.")
     return final_df
