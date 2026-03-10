@@ -410,7 +410,7 @@ def get_user_input(dataframe):
         except NameError:
             print("Error getting input. Please try again.")
     
-    print(f"✓ Selected '{search_type}' search.")
+    print(f"✓ '{search_type}' search.")
     
     # 2. Create search_params dict to hold parameters for the ADS search query
     search_params = {'search_type': search_type}
@@ -418,16 +418,18 @@ def get_user_input(dataframe):
     
     if search_type == 'name':
         search_params['name_column'] = find_column("Enter the name of the column that contains the data for 'name' search: ", "Name")
-        print(f"✓ Selected '{search_params['name_column']}' column.")
+        search_params['institution_column'] = None
+        print(f"✓ '{search_params['name_column']}' column.")
 
     else:
         search_params['institution_column'] = find_column("Enter the name of the column that contains the data for 'institution' search: ", "Name")
-        print(f"✓ Selected '{search_params['institution_column']}' column.")
+        print(f"✓ '{search_params['institution_column']}' column.")
+        search_params['name_column'] = None
         search_params['deep_dive'] = ask_yes_no("Do you want to run a deep dive search (re-run for each author) for institution search?", default="n")
-        print(f"✓ Selected '{search_params['deep_dive']}' for deep dive.")
+        print(f"✓ '{search_params['deep_dive']}' for deep dive.")
 
     search_params['second_author'] = ask_yes_no("Do you want to include search by second author? (y/n) [n]: ", default="n") 
-    print(f"✓ Selected '{search_params['second_author']}' for second author search.")
+    print(f"✓ '{search_params['second_author']}' for second author search.")
     
     # 3. Year and filter options
     print("\nNOTE:")
@@ -438,14 +440,14 @@ def get_user_input(dataframe):
 
     year_range = input("Enter the year range for your search (format: [YYYY TO YYYY] or a 4-digit year, default: [2003 TO 2030]): ").strip() or "[2003 TO 2030]"
     search_params['year_range'] = year_range
-    print(f"✓ Selected '{search_params['year_range']}' for the year range.")
+    print(f"✓ '{search_params['year_range']}' for the year range.")
     
     is_refereed = ask_yes_no("Do you want refereed papers only? (y/n) [y]:", default="y")
     search_params['refereed'] = "property:refereed" if is_refereed else "property:notrefereed OR property:refereed"
-    print(f"✓ Selected '{search_params['refereed']}' for refereed papers.")
+    print(f"✓ '{search_params['refereed']}' for refereed papers.")
 
     search_params['early_career_filter'] = ask_yes_no("Filter results for early-career researchers ONLY?")
-    print(f"✓ Selected '{"Yes" if search_params['early_career_filter'] == True else "No"}' for early-career researchers.")   
+    print(f"✓ '{"Yes" if search_params['early_career_filter'] == True else "No"}' for early-career researchers.")   
 
     return search_params
 
@@ -475,7 +477,11 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     search_type = search_params['search_type']
 
     # Identify which column we are iterating over
-    target_col = search_params.get('name_column') if search_type == 'name' else search_params.get('institution_column')
+    # Identify which column we are iterating over
+    if search_type == 'name':
+        target_col = search_params.get('name_column')
+    else:
+        target_col = search_params.get('institution_column')
     
     print(f"\nStarting {search_type} search for {len(raw_data)} rows...")
 
