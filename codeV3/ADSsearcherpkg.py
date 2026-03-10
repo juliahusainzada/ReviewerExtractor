@@ -80,12 +80,6 @@ def format_year(year):
     """
     # If already a range, return as is 
     if isinstance(year, str) and "TO" in year:
-        try:
-            start_year = int(year.strip('[]').split(' TO ')[0])
-            if start_year >= 2010:
-                print("Warning: Your year range starts at or after 2010. Early-career classification may be inaccurate.")
-        except (ValueError, IndexError):
-            raise ValueError("Invalid year range format. Please provide a range in the format [YYYY TO YYYY].")
         return year
 
     # Try to parse as a number and convert to range
@@ -126,6 +120,11 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
     if year:
         years = format_year(year)
         query_parts.append(f'pubdate:{years}')
+    
+    # Give warning if year range starts at or after 2010 since early-career classification will be inaccurate without earlier publication data
+    start_year = int(year.strip('[]').split(' TO ')[0])
+    if start_year >= 2010:
+        print("Warning: Your year range starts at or after 2010. Early-career classification may be inaccurate.")
     
     if not query_parts:
         print("You did not give me enough to search on, please try again.")
