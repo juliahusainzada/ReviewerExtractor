@@ -92,7 +92,7 @@ def format_year(year):
     except ValueError:
         raise ValueError("Invalid year format. Please provide a 4-digit year or a range in the format [YYYY TO YYYY].")
 
-def ads_search(name=None, institution=None, year=None, refereed='property:notrefereed OR property:refereed', \
+def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False, early_career=None):
     """
     Builds a query for ADS search based on name, institution, year, second_author.
