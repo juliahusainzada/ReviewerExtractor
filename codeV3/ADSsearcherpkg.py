@@ -126,6 +126,7 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
 
     # Deep dive search
     if institution and deep_dive:
+        AUTHOR_MAP = set()
         print(f"Step 1: Scouting author names for {institution}...")
         
         # Light search to only get author names
@@ -210,8 +211,9 @@ def ads_search(name=None, institution=None, year=None, refereed='property:notref
 
         if early_career is not None:
             data5 = data4[data4['Early Career'] == early_career]
-        
-        data6 = n_grams(data5, stop_dir)
+            data6 = n_grams(data5, stop_dir)
+        else:
+            data6 = n_grams(data4, stop_dir)
 
         return data6
     
