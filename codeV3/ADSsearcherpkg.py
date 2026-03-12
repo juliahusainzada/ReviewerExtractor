@@ -93,21 +93,71 @@ def format_year(year):
         raise ValueError("Invalid year format. Please provide a 4-digit year or a range in the format [YYYY TO YYYY].")
 
 def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='property:notrefereed OR property:refereed', \
-               token=None, stop_dir=None, second_auth=False,groq_analysis=False,deep_dive=False, early_career=None):
+               token=None, stop_dir=None, second_auth=False, deep_dive=False, early_career=None, \
+                filename=None, search_type=None, institution_column=None, name_column=None):
     """
     Builds a query for ADS search based on name, institution, year, second_author.
-    
+    If filename is provided, it iterates through the file and performs a batch search.
+
     Builds with a Global AUTHOR_LOOKUP_CACHE to prevent redundant author lookups.
 
     Returns a dataframe with the results of the search for a given author or institution, 
     including merged results for authors across institutions and n-gram analysis of abstracts.
     """
     global AUTHOR_LOOKUP_CACHE
-    query_parts = []
 
+    # ---------------- 1. Building the Query ----------------
+    if filename:
+        try:
+            raw_data = pd.read_csv(filename, quotechar='"')
+            # Determine search type and target column
+            if search_type.lower() == 'institution':
+                target_col = institution_column or "Institution"
+            else:
+                target_col = name_column or "Name"
+            
+            all_results = []
+            print(f"Processing file: {filename} ({len(raw_data)} rows)...")
+
+            for index, row in raw_data.iterrows():
+                search_val = str(row.get(target_col, "")).strip().strip('"')
+                if not search_val or search_val.lower() == "nan":
+                    continue
+
+                print(f"[{index + 1}/{len(raw_data)}] Searching for: {search_val}")
+
+                row_df = ads_search(
+                    name=search_val if search_type.lower() == 'name' else None,
+                    institution=search_val if search_type.lower() == 'institution' else None,
+                    year=year,
+                    refereed=refereed,
+                    token=token,
+                    stop_dir=stop_dir,
+                    second_auth=second_auth,
+                    deep_dive=deep_dive,
+                    early_career=early_career
+                )
+
+                if not row_df.empty:
+                    all_results.append(row_df)
+                
+                time.sleep(ADS_RATE_LIMIT)
+            
+            if not all_results:
+                return pd.DataFrame()
+            
+            final_df = pd.concat(all_results, ignore_index=True)
+            return process_results(final_df, stop_dir, early_career)
+
+        except FileNotFoundError:
+            print(f"Error: The file '{filename}' was not found.")
+            return pd.DataFrame()
+            
     # ---------------- 1. Building the Query ----------------
     # We only build the query on the name if it's not a deep dive institution search, 
     # otherwise we will search by institution and then deep dive by author name
+    query_parts = []
+
     if name and not deep_dive:
         if second_auth:
             query_parts.append(f'(first_author:"{name}" OR pos(author:"{name}",2))')
