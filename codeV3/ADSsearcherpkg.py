@@ -117,6 +117,7 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
                 target_col = name_column or "Name"
             
             all_results = []
+            failed_searches = []
             print(f"Processing file: {filename} ({len(raw_data)} rows)...")
 
             for index, row in raw_data.iterrows():
@@ -140,8 +141,17 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
 
                 if not row_df.empty:
                     all_results.append(row_df)
+                else:
+                    failed_searches.append(search_val)
                 
                 time.sleep(ADS_RATE_LIMIT)
+            
+            if failed_searches:
+                print("\n--- SEARCH FAILURES ---")
+                print(f"The following {len(failed_searches)} items returned NO results:")
+                for item in failed_searches:
+                    print(f"{item}")
+                print("-----------------------\n")
             
             if not all_results:
                 return pd.DataFrame()
@@ -519,6 +529,7 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     search_params = get_user_input(raw_data)
     
     all_results = []
+    failed_searches = []
 
     # Map the boolean choice
     # If filter is False (user said 'n'), we pass None
@@ -566,8 +577,21 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     
         if not result_df.empty:
             all_results.append(result_df)
-        
+        else:
+            failed_searches.append(search_val)
+
         time.sleep(ADS_RATE_LIMIT)
+    
+    if failed_searches:
+        print("\n" + "!"*30)
+        print(f"NOTICE: {len(failed_searches)} searches returned zero results.")
+        print("This usually means the institution name is formatted differently in ADS or the year range is too restrictive.")
+        print(f"Failed items: {', '.join(failed_searches)}")
+        print("!"*30 + "\n")
+
+        # Optional: Save failures to a CSV for manual inspection
+        pd.DataFrame(failed_searches, columns=['Failed_Search_Term']).to_csv("failed_searches.csv", index=False)
+
     
     # --------- 3. Combine results and post-process ---------
     if not all_results:
