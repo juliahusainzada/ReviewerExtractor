@@ -10,7 +10,10 @@ import time
 ADS_SEARCH_URL = "https://api.adsabs.harvard.edu/v1/search/query"
 ADS_RATE_LIMIT = 0.2
 BATCH_SIZE = 25
+INST_BATCH_SIZE = 10
 
+# Create a single session for all requests to take advantage of connection pooling and reduce overhead
+http_session = requests.Session()
 # Global tracker to prevent redundant author lookups in deep dives
 AUTHOR_LOOKUP_CACHE = set()
 
@@ -21,7 +24,7 @@ def chunk_list(data_list, size):
     for i in range(0, len(data_list), size):
         yield data_list[i:i + size]
 
-def do_search(input_name, input_inst, auth_token, query):
+def do_search(input_name, input_inst, auth_token, query, max_retries = 3):
     """
     Runs ADS search based on specified query built in ads_search.
     
@@ -29,68 +32,63 @@ def do_search(input_name, input_inst, auth_token, query):
     """
     time.sleep(ADS_RATE_LIMIT)
     
-    # ends an HTTP GET to the ADS search endpoint using the query string q and authenticates with a Bearer token t
-    results = requests.get(
-        "https://api.adsabs.harvard.edu/v1/search/query?{}".format(query),
-        headers={'Authorization': 'Bearer ' + auth_token}
-    )
+    headers = {'Authorization': 'Bearer ' + auth_token}
+    url = f"{ADS_SEARCH_URL}?{query}"
 
-    # Takes results as json
-    try:
-        json_data = results.json()
-    except ValueError:
-        time.sleep(ADS_RATE_LIMIT)
+    backoff = 2.0  # Initial wait if rate limited
+
+    for attempt in range(max_retries):
         try:
-            json_data = results.json()
-        except ValueError:
-            print("ADS API returned non‑JSON response:", results.status_code, results.text[:200])
-            return pd.DataFrame()
-    
-    # Docs contains each paper that matches the search query
-    # We extract relevant fields to create a DataFrame
-    data = json_data["response"]["docs"] 
+            response = http_session.get(url, headers=headers)
 
-    df_data = {
-        'Input Author': [input_name] * len(data),
-        'Input Institution': [input_inst] * len(data),
-        'First Author': [d['first_author'] for d in data],
-        'Bibcode': [d['bibcode'] for d in data],
-        'Title': [d.get('title', '') for d in data],
-        'Publication Date': [d['pubdate'] for d in data],
-        'Keywords': [d.get('keyword', []) for d in data],
-        'Affiliations': [d['aff'][0] for d in data],
-        'Abstract': [d.get('abstract', '') for d in data],
-        'Identifier': [d.get('identifier', []) for d in data],
-        'Data Type': ['']*len(data)
-    }
+            # Case 1: Success
+            if response.status_code == 200:
+                json_data = response.json()
+                data = json_data.get("response", {}).get("docs", [])
 
-    df = pd.DataFrame(df_data)
+                if not data:
+                    return pd.DataFrame()  # No results found
 
-    # If no input name was provided, use the discovered first author
-    # Input name may not be provided in institution searches,
-    # so we want to preserve the discovered first author as the input author
-    if input_name is None:
-        df['Input Author'] = df['First Author']
-    
-    return df
+                df_data = {
+                    'Input Author': [input_name] * len(data),
+                    'Input Institution': [input_inst] * len(data),
+                    'First Author': [d.get('first_author', 'Unknown') for d in data],
+                    'Bibcode': [d.get('bibcode', 'Unknown') for d in data],
+                    'Title': [d.get('title', [''])[0] if isinstance(d.get('title'), list) else d.get('title', '') for d in data],
+                    'Publication Date': [d.get('pubdate', '0000-00') for d in data],
+                    'Keywords': [d.get('keyword', []) for d in data],
+                    'Affiliations': [d.get('aff', ['Unknown'])[0] if d.get('aff') else 'Unknown' for d in data],
+                    'Abstract': [d.get('abstract', '') for d in data],
+                    'Identifier': [d.get('identifier', []) for d in data],
+                    'Data Type': ['']*len(data)
+                }
 
-def format_year(year):
-    """
-    Standardizes year input into an ADS-compatible [YYYY TO YYYY] string
-    """
-    # If already a range, return as is 
-    if isinstance(year, str) and "TO" in year:
-        return year
+                df = pd.DataFrame(df_data)
 
-    # Try to parse as a number and convert to range
-    try:
-        base_year = int(float(year))
-        if base_year - 1 >= 2010:
-            print("Warning: Your year input corresponds to a range starting at or after 2010. Early-career classification may be inaccurate.")
-        return f"[{base_year - 1} TO {base_year + 4}]"
-    
-    except ValueError:
-        raise ValueError("Invalid year format. Please provide a 4-digit year or a range in the format [YYYY TO YYYY].")
+                # If no input name was provided, use the discovered first author
+                # Input name may not be provided in institution searches,
+                # so we want to preserve the discovered first author as the input author
+                if input_name is None:
+                    df['Input Author'] = df['First Author']
+                
+                return df
+            
+            # Case 2: Syntax Error
+            elif response.status_code == 400:
+                print(f"API Syntax Error (400). Check query format: {query[:100]}...")
+                return pd.DataFrame()
+            
+            # Case 3: Rate limited
+            elif response.status_code == 429:
+                print(f"Rate limit hit (429). Attempt {attempt+1}: Waiting {backoff}s...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponentially increase wait time
+            
+        except Exception as e:
+            print(f"Connection error: {e}. Retrying...")
+            time.sleep(backoff)
+        
+    return pd.DataFrame()  # Return empty DataFrame if all retries fail
 
 def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False, deep_dive=False, early_career=False, \
@@ -106,7 +104,7 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     """
     global AUTHOR_LOOKUP_CACHE
 
-    # ---------------- 1. Building the Query ----------------
+    # ---------------- 1. FILE BASED BATCH SEARCH ----------------
     if filename:
         try:
             raw_data = pd.read_csv(filename, quotechar='"')
@@ -116,67 +114,123 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             else:
                 target_col = name_column or "Name"
             
+            # Get unique values to avoid redundant searching of the same CSV entry
+            search_list = raw_data[target_col].dropna().unique().tolist()
             all_results = []
             failed_searches = []
+
             print(f"Processing file: {filename} ({len(raw_data)} rows)...")
 
-            for index, row in raw_data.iterrows():
-                search_val = str(row.get(target_col, "")).strip().strip('"')
-                if not search_val or search_val.lower() == "nan":
-                    continue
-
-                print(f"[{index + 1}/{len(raw_data)}] Searching for: {search_val}")
-
-                row_df = ads_search(
-                    name=search_val if search_type.lower() == 'name' else None,
-                    institution=search_val if search_type.lower() == 'institution' else None,
-                    year=year,
-                    refereed=refereed,
-                    token=token,
-                    stop_dir=stop_dir,
-                    second_auth=second_auth,
-                    deep_dive=deep_dive,
-                    early_career=early_career
-                )
-
-                if not row_df.empty:
-                    all_results.append(row_df)
-                else:
-                    failed_searches.append(search_val)
+            # --- CASE A: Institution Deep Dive (Batched) ---
+            if search_type.lower() == 'institution' and deep_dive:
+                print(f"Step 1: Scouting author names for {len(search_list)} institutions in batches of {INST_BATCH_SIZE}...")
                 
-                time.sleep(ADS_RATE_LIMIT)
-            
+                for inst_batch in chunk_list(search_list, INST_BATCH_SIZE):
+                    # 1. Try strict search [pos(inst, 1)]
+                    inst_or_group = " OR ".join([f'pos(institution:"{i}",1)' for i in inst_batch])
+                    q_strict = f'({inst_or_group})' # Cleaned up string
+
+                    batch_df = ads_search(
+                        institution=q_strict, 
+                        year=year, 
+                        refereed=refereed, 
+                        token=token, 
+                        stop_dir=stop_dir,
+                        early_career=early_career,
+                        deep_dive=True
+                        )
+
+                    found_insts_in_batch = set()
+                    if not batch_df.empty:
+                        all_results.append(batch_df)
+                        # Identify who succeeded (case-insensitive check)
+                        for i in inst_batch:
+                            if any(i.lower() in str(aff).lower() for aff in batch_df['Affiliations']):
+                                found_insts_in_batch.add(i)
+                
+                    # 2. Fallback for Failures [aff:{name}]
+                    failed_insts_in_batch = [i for i in inst_batch if i not in found_insts_in_batch]
+                    if failed_insts_in_batch:
+                        print(f"⚠️ {len(failed_insts_in_batch)} institutions failed strict search. Running 'aff:' fallback...")
+                        aff_or_group = " OR ".join([f'aff:"{i}"' for i in failed_insts_in_batch])
+                        q_fallback = f'first_author:"^" AND ({aff_or_group})'
+                        fallback_df = ads_search(
+                            institution=q_fallback, 
+                            year=year, 
+                            refereed=refereed, 
+                            token=token, 
+                            stop_dir=stop_dir,
+                            early_career=early_career,
+                            deep_dive=True
+                            )
+                    
+                        if not fallback_df.empty:
+                            all_results.append(fallback_df)
+                            for i in failed_insts_in_batch:
+                                if any(i.lower() in str(aff).lower() for aff in fallback_df['Affiliations']):
+                                    found_insts_in_batch.add(i)
+                    
+                    # 3. Track institutions that failed in both strict (inst: {name}) and fallback (aff: {name}) searches for final reporting
+                    really_failed = [i for i in inst_batch if i not in found_insts_in_batch]
+                    failed_searches.extend(really_failed)
+
+            # --- CASE B: Standard Name Search or Institution Search (No Deep Dive)
+            else:
+                for search_val in search_list:
+                    print(f"Searching for: {search_val}")
+                    row_df = ads_search(
+                        name=search_val if search_type.lower() == 'name' else None,
+                        institution=search_val if search_type.lower() == 'institution' else None,                            year=year, 
+                        refereed=refereed, 
+                        token=token, 
+                        stop_dir=stop_dir,
+                        early_career=early_career,
+                        second_auth=second_auth, 
+                        deep_dive=False
+                    )
+                    
+                    if not row_df.empty:
+                        all_results.append(row_df)
+                    else:
+                        failed_searches.append(search_val)
+
+            # Final wrap up   
             if failed_searches:
-                print("\n--- SEARCH FAILURES ---")
-                print(f"The following {len(failed_searches)} items returned NO results:")
-                for item in failed_searches:
-                    print(f"{item}")
-                print("-----------------------\n")
+                print(f"\n--- SEARCH FAILURES ({len(failed_searches)}) ---")
+                print(f"Items with no results: {', '.join(failed_searches)}\n")
             
-            if not all_results:
+            if not all_results: 
                 return pd.DataFrame()
-            
+
             final_df = pd.concat(all_results, ignore_index=True)
             return process_results(final_df, stop_dir, early_career)
-
-        except FileNotFoundError:
-            print(f"Error: The file '{filename}' was not found.")
+        
+        except Exception as e:
+            print(f"Error processing file: {e}")
             return pd.DataFrame()
             
-    # ---------------- 1. Building the Query ----------------
+    # ---------------- 2. QUERY BUILDING ----------------
     # We only build the query on the name if it's not a deep dive institution search, 
     # otherwise we will search by institution and then deep dive by author name
     query_parts = []
 
+    # Check if this is a deep dive author discovery call or standard
+    # --- CHANGE THIS SECTION IN THE QUERY BUILDING PART ---
+    if institution:
+        # If it's already a complex query (contains OR, aff, or pos), use as-is
+        if any(keyword in institution for keyword in ["aff:", " OR ", "pos("]):
+            query_parts.append(institution)
+        else:
+            query_parts.append(f'pos(institution:"{institution}",1)')
+
     if name and not deep_dive:
+        # Ensure name is properly quoted
         if second_auth:
             query_parts.append(f'(first_author:"{name}" OR pos(author:"{name}",2))')
         else:
+            # Use a proper wildcard or just the name if the caret is causing issues
             query_parts.append(f'first_author:"^{name}"')
-    
-    if institution:
-        query_parts.append(f'pos(institution:"{institution}",1)')
-    
+        
     if year:
         years = format_year(year)
         query_parts.append(f'pubdate:{years}')
@@ -194,29 +248,26 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     # and then build author queries on top of that base query
     base_query = " AND ".join(query_parts)
 
-    # ---------------- 2. Deep Dive Logic ----------------
+    # ---------------- 3. DEEP DIVE LOGIC (Discovery -> Scraping) ----------------
     # Scout for authors at an institution first
-    if institution and deep_dive:
-        AUTHOR_LOOKUP_CACHE = set()
-        print(f"Step 1: Scouting author names for {institution}...")
-        
-        # Light search to only get author names
-        discovery_params = {
-            "q": base_query,
+    if institution and deep_dive:        
+        print(f"Step 1: Scouting author names...")
+        discovery_params = urlencode({
+            "q": base_query, # base_query now contains only valid institution filters
             "fl": "first_author",
-            "fq": "database:astronomy," + str(refereed),
+            "fq": f"database:astronomy,{refereed}",
             "rows": 3000,
-        }
+        })
 
-        res = requests.get(
-            f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}",
-            headers={'Authorization': 'Bearer ' + token}
-        ).json()
+        res_df = do_search(None, institution, token, discovery_params)
 
-        if "response" in res and res["response"]["docs"]:
-            unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
+        if not res_df.empty:
+            unique_authors = res_df['First Author'].unique()
             new_authors = [a for a in unique_authors if a not in AUTHOR_LOOKUP_CACHE]
 
+            if not new_authors:
+                return pd.DataFrame()
+            
             print(f"Deep Diving {len(unique_authors)} unique authors...")
             all_author_dfs = []
 
@@ -254,7 +305,7 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             else:
                 return pd.DataFrame()
             
-    # ---------------- 3. Standard Search Logic ----------------
+    # ---------------- 4. STANDARD SEARCH LOGIC ----------------
     # Note: Not deep dive
     encoded_query = urlencode({
         "q": base_query,
@@ -271,6 +322,25 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     else:
         print("No results found.")
         return pd.DataFrame()
+
+def format_year(year):
+    """
+    Standardizes year input into an ADS-compatible [YYYY TO YYYY] string
+    """
+    # If already a range, return as is 
+    if isinstance(year, str) and "TO" in year:
+        return year
+
+    # Try to parse as a number and convert to range
+    try:
+        base_year = int(float(year))
+        if base_year - 1 >= 2010:
+            print("Warning: Your year input corresponds to a range starting at or after 2010. Early-career classification may be inaccurate.")
+        return f"[{base_year - 1} TO {base_year + 4}]"
+    
+    except ValueError:
+        raise ValueError("Invalid year format. Please provide a 4-digit year or a range in the format [YYYY TO YYYY].")
+
 
 def process_results(df, stop_dir, early_career=False):
     """
