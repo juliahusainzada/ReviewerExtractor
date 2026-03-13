@@ -93,7 +93,7 @@ def format_year(year):
         raise ValueError("Invalid year format. Please provide a 4-digit year or a range in the format [YYYY TO YYYY].")
 
 def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='property:notrefereed OR property:refereed', \
-               token=None, stop_dir=None, second_auth=False, deep_dive=False, early_career=None, \
+               token=None, stop_dir=None, second_auth=False, deep_dive=False, early_career=False, \
                 filename=None, search_type=None, institution_column=None, name_column=None):
     """
     Builds a query for ADS search based on name, institution, year, second_author.
@@ -262,7 +262,7 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
         print("No results found.")
         return pd.DataFrame()
 
-def process_results(df, stop_dir, early_career=None):
+def process_results(df, stop_dir, early_career=False):
     """
     Post-process the search results.
     
@@ -283,8 +283,8 @@ def process_results(df, stop_dir, early_career=None):
     df = data_type(df)
     df = apply_early_career_flag(df)
     
-    if early_career is not None:
-        df = df[df['Early Career'] == early_career]
+    if early_career is True:
+        df = df[df['Early Career'] == True]
     
     df = compute_n_grams(df, stop_dir)
     
@@ -522,7 +522,7 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
 
     # Map the boolean choice
     # If filter is False (user said 'n'), we pass None
-    ec_filter_val = True if search_params['early_career_filter'] else None
+    ec_filter_val = search_params['early_career_filter']
 
     search_type = search_params['search_type']
 
