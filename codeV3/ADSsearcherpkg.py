@@ -213,6 +213,14 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             headers={'Authorization': 'Bearer ' + token}
         ).json()
 
+        if ("response" not in res or not res["response"]["docs"]):
+            print(f"No results for institution '{institution}'. Retrying with affiliation fallback...")
+            discovery_params["q"] = base_query.replace(f'pos(institution:"{institution}",1)', f'pos(aff:"{institution}",1)')
+            res = requests.get(
+                f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}",
+                headers={'Authorization': 'Bearer ' + token}
+            ).json()
+
         if "response" in res and res["response"]["docs"]:
             unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
             new_authors = [a for a in unique_authors if a not in AUTHOR_LOOKUP_CACHE]
@@ -265,6 +273,18 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     })
 
     results_df = do_search(name, institution, token, encoded_query)
+
+    if results_df.empty and institution and not deep_dive:
+        print(f"No results for institution '{institution}'. Retrying with affiliation fallback...")
+        fallback_query = base_query.replace(f'pos(institution:"{institution}",1)', f'pos(aff:"{institution}",1)')
+        encoded_fallback = urlencode({
+            "q": fallback_query,
+            "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
+            "fq": "database:astronomy," + str(refereed),
+            "rows": 3000,
+            "sort": "date desc"
+        })
+        results_df = do_search(name, institution, token, encoded_fallback)
 
     if not results_df.empty:
        return process_results(results_df, stop_dir, early_career)
