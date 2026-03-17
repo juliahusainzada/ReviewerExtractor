@@ -9,10 +9,49 @@ import time
 # Define constants
 ADS_SEARCH_URL = "https://api.adsabs.harvard.edu/v1/search/query"
 ADS_RATE_LIMIT = 0.2
-BATCH_SIZE = 25
+BATCH_SIZE = 40
 
 # Global tracker to prevent redundant author lookups in deep dives
 AUTHOR_LOOKUP_CACHE = set()
+
+def make_ads_request(url, headers, max_retries=5):
+    """
+    Wrapper for requests.get to cleanly handle ADS API rate limits (HTTP 429).
+    """
+    retries = 0
+    while retries < max_retries:
+        time.sleep(ADS_RATE_LIMIT)
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError:
+                print("ADS API returned non-JSON response:", response.status_code, response.text[:200])
+                return None
+        elif response.status_code == 429:
+            # Rate limited
+            reset_time_str = response.headers.get('X-RateLimit-Reset')
+            if reset_time_str:
+                try:
+                    reset_timestamp = int(reset_time_str)
+                    current_time = int(time.time())
+                    sleep_duration = max(reset_timestamp - current_time, 1) + 1 # +1 buffer
+                    print(f"Rate limited (429). Sleeping for {sleep_duration} seconds...")
+                    time.sleep(sleep_duration)
+                except ValueError:
+                    print("Could not parse X-RateLimit-Reset header. Sleeping for 60 seconds...")
+                    time.sleep(60)
+            else:
+                print("Rate limited but no X-RateLimit-Reset header found. Sleeping for 60 seconds...")
+                time.sleep(60)
+            retries += 1
+        else:
+            print(f"ADS API error: {response.status_code} - {response.text[:200]}")
+            return None
+            
+    print("Max retries exceeded for ADS API.")
+    return None
 
 def chunk_list(data_list, size):
     """
@@ -27,24 +66,13 @@ def do_search(input_name, input_inst, auth_token, query):
     
     Returns a dataframe with the results of the search for a given author or institution.
     """
-    time.sleep(ADS_RATE_LIMIT)
+    url = f"https://api.adsabs.harvard.edu/v1/search/query?{query}"
+    headers = {'Authorization': 'Bearer ' + auth_token}
     
-    # ends an HTTP GET to the ADS search endpoint using the query string q and authenticates with a Bearer token t
-    results = requests.get(
-        "https://api.adsabs.harvard.edu/v1/search/query?{}".format(query),
-        headers={'Authorization': 'Bearer ' + auth_token}
-    )
-
-    # Takes results as json
-    try:
-        json_data = results.json()
-    except ValueError:
-        time.sleep(ADS_RATE_LIMIT)
-        try:
-            json_data = results.json()
-        except ValueError:
-            print("ADS API returned non‑JSON response:", results.status_code, results.text[:200])
-            return pd.DataFrame()
+    json_data = make_ads_request(url, headers)
+    
+    if json_data is None or "response" not in json_data or "docs" not in json_data["response"]:
+        return pd.DataFrame()
     
     # Docs contains each paper that matches the search query
     # We extract relevant fields to create a DataFrame
@@ -94,7 +122,7 @@ def format_year(year):
 
 def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='property:notrefereed OR property:refereed', \
                token=None, stop_dir=None, second_auth=False, deep_dive=False, early_career=False, \
-                filename=None, search_type=None, institution_column=None, name_column=None):
+                filename=None, search_type=None, institution_column=None, name_column=None, process=True, clear_cache=True):
     """
     Builds a query for ADS search based on name, institution, year, second_author.
     If filename is provided, it iterates through the file and performs a batch search.
@@ -105,6 +133,8 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     including merged results for authors across institutions and n-gram analysis of abstracts.
     """
     global AUTHOR_LOOKUP_CACHE
+    if clear_cache:
+        AUTHOR_LOOKUP_CACHE = set()
 
     # ---------------- 1. Building the Query ----------------
     if filename:
@@ -118,8 +148,114 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             
             all_results = []
             failed_searches = []
+            fallback_institutions = []
             print(f"Processing file: {filename} ({len(raw_data)} rows)...")
 
+            if search_type.lower() == 'institution' and deep_dive:
+                all_unique_authors = set()
+                author_to_institutions = {}
+                
+                # --- Phase 1: Global Scouting ---
+                print(f"\n--- Phase 1: Institutional Scouting ---")
+                for index, row in raw_data.iterrows():
+                    search_val = str(row.get(target_col, "")).strip().strip('"')
+                    if not search_val or search_val.lower() == "nan":
+                        continue
+                        
+                    print(f"[{index + 1}/{len(raw_data)}] Scouting institution: {search_val}")
+                    
+                    query_parts = [f'pos(institution:"{search_val}",1)']
+                    if year:
+                        query_parts.append(f'pubdate:{format_year(year)}')
+                    base_query = " AND ".join(query_parts)
+                    
+                    discovery_params = {
+                        "q": base_query,
+                        "fl": "first_author",
+                        "fq": "database:astronomy," + str(refereed),
+                        "rows": 3000,
+                    }
+                    url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+                    headers = {'Authorization': 'Bearer ' + token}
+                    res = make_ads_request(url, headers)
+                    
+                    if not res or "response" not in res or not res["response"]["docs"]:
+                        print(f"  No results. Retrying with affiliation fallback...")
+                        fallback_institutions.append(search_val)
+                        discovery_params["q"] = base_query.replace(f'pos(institution:"{search_val}",1)', f'pos(aff:"{search_val}",1)')
+                        url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+                        res = make_ads_request(url, headers)
+                        
+                    if res and "response" in res and res["response"]["docs"]:
+                        unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
+                        for author in unique_authors:
+                            all_unique_authors.add(author)
+                            if author not in author_to_institutions:
+                                author_to_institutions[author] = []
+                            author_to_institutions[author].append(search_val)
+                    else:
+                        print(f"  Fallback failed. Adding {search_val} to failed searches.")
+                        failed_searches.append(search_val)
+
+                # --- Phase 2: Global Batch Fetching ---
+                new_authors = [a for a in all_unique_authors if a not in AUTHOR_LOOKUP_CACHE]
+                
+                print(f"\n--- Phase 2: Batch Deep Dive Fetching ({len(new_authors)} unique authors globally) ---")
+                all_author_dfs = []
+                author_batches = list(chunk_list(new_authors, BATCH_SIZE))
+                
+                for batch_idx, author_batch in enumerate(author_batches):
+                    print(f"Processing batch {batch_idx + 1}/{len(author_batches)} ({len(author_batch)} authors)...")
+                    author_sub_query = " OR ".join([f'first_author:"{a}"' for a in author_batch])
+                    batch_query = [f"({author_sub_query})"]
+                    
+                    if year:
+                        batch_query.append(f'pubdate:{format_year(year)}')
+                    batch_query = " AND ".join(batch_query)
+                    
+                    encoded_batch_query = urlencode({
+                        "q": batch_query,
+                        "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
+                        "fq": "database:astronomy," + str(refereed),
+                        "rows": 3000,
+                        "sort": "date desc"
+                    })
+                    
+                    df_batch = do_search(None, None, token, encoded_batch_query)
+                    if not df_batch.empty:
+                        all_author_dfs.append(df_batch)
+                        
+                    AUTHOR_LOOKUP_CACHE.update(author_batch)
+
+                if fallback_institutions:
+                    print("\n--- FALLBACK INSTITUTIONS ---")
+                    print(f"The following {len(fallback_institutions)} items had no institution results and fell back to affiliation:")
+                    for item in fallback_institutions:
+                        print(f"{item}")
+                    print("-----------------------------\n")
+
+                if failed_searches:
+                    print("\n--- SEARCH FAILURES ---")
+                    print(f"The following {len(failed_searches)} items returned NO results:")
+                    for item in failed_searches:
+                        print(f"{item}")
+                    print("-----------------------\n")
+                    
+                if all_author_dfs:
+                    final_df = pd.concat(all_author_dfs, ignore_index=True)
+                    def assign_insts(author):
+                        insts = author_to_institutions.get(author, [])
+                        return ", ".join(insts) if insts else None
+                    final_df['Input Institution'] = final_df['First Author'].apply(assign_insts)
+                    
+                    if process:
+                        return process_results(final_df, stop_dir, early_career)
+                    else:
+                        return final_df
+                else:
+                    return pd.DataFrame()
+
+            # --------- Standard Batch Iteration --------- 
             for index, row in raw_data.iterrows():
                 search_val = str(row.get(target_col, "")).strip().strip('"')
                 if not search_val or search_val.lower() == "nan":
@@ -136,7 +272,9 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
                     stop_dir=stop_dir,
                     second_auth=second_auth,
                     deep_dive=deep_dive,
-                    early_career=early_career
+                    early_career=early_career,
+                    process=False,
+                    clear_cache=False # Maintain internal cache during standard iteration
                 )
 
                 if not row_df.empty:
@@ -145,6 +283,13 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
                     failed_searches.append(search_val)
                 
                 time.sleep(ADS_RATE_LIMIT)
+            
+            if fallback_institutions:
+                print("\n--- FALLBACK INSTITUTIONS ---")
+                print(f"The following {len(fallback_institutions)} items had no institution results and fell back to affiliation:")
+                for item in fallback_institutions:
+                    print(f"{item}")
+                print("-----------------------------\n")
             
             if failed_searches:
                 print("\n--- SEARCH FAILURES ---")
@@ -157,7 +302,10 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
                 return pd.DataFrame()
             
             final_df = pd.concat(all_results, ignore_index=True)
-            return process_results(final_df, stop_dir, early_career)
+            if process:
+                return process_results(final_df, stop_dir, early_career)
+            else:
+                return final_df
 
         except FileNotFoundError:
             print(f"Error: The file '{filename}' was not found.")
@@ -197,7 +345,7 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
     # ---------------- 2. Deep Dive Logic ----------------
     # Scout for authors at an institution first
     if institution and deep_dive:
-        AUTHOR_LOOKUP_CACHE = set()
+        # AUTHOR_LOOKUP_CACHE = set()
         print(f"Step 1: Scouting author names for {institution}...")
         
         # Light search to only get author names
@@ -208,20 +356,17 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             "rows": 3000,
         }
 
-        res = requests.get(
-            f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}",
-            headers={'Authorization': 'Bearer ' + token}
-        ).json()
+        url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+        headers = {'Authorization': 'Bearer ' + token}
+        res = make_ads_request(url, headers)
 
-        if ("response" not in res or not res["response"]["docs"]):
+        if not res or ("response" not in res or not res["response"]["docs"]):
             print(f"No results for institution '{institution}'. Retrying with affiliation fallback...")
             discovery_params["q"] = base_query.replace(f'pos(institution:"{institution}",1)', f'pos(aff:"{institution}",1)')
-            res = requests.get(
-                f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}",
-                headers={'Authorization': 'Bearer ' + token}
-            ).json()
+            url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+            res = make_ads_request(url, headers)
 
-        if "response" in res and res["response"]["docs"]:
+        if res and "response" in res and res["response"]["docs"]:
             unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
             new_authors = [a for a in unique_authors if a not in AUTHOR_LOOKUP_CACHE]
 
@@ -258,7 +403,10 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
             # AFTER all batches:
             if all_author_dfs:
                 full_df = pd.concat(all_author_dfs, ignore_index=True)
-                return process_results(full_df, stop_dir, early_career)
+                if process:
+                    return process_results(full_df, stop_dir, early_career)
+                else:
+                    return full_df
             else:
                 return pd.DataFrame()
             
@@ -287,7 +435,10 @@ def ads_search(name=None, institution=None, year="[2003 TO 2030]", refereed='pro
         results_df = do_search(name, institution, token, encoded_fallback)
 
     if not results_df.empty:
-       return process_results(results_df, stop_dir, early_career)
+       if process:
+           return process_results(results_df, stop_dir, early_career)
+       else:
+           return results_df
     else:
         print("No results found.")
         return pd.DataFrame()
@@ -550,6 +701,7 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     
     all_results = []
     failed_searches = []
+    fallback_institutions = []
 
     # Map the boolean choice
     # If filter is False (user said 'n'), we pass None
@@ -566,7 +718,113 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
     
     print(f"\nStarting {search_type} search for {len(raw_data)} rows...")
 
-    # --------- 2. Process each row in the CSV --------- 
+    if search_type == 'institution' and search_params.get('deep_dive', False):
+        all_unique_authors = set()
+        author_to_institutions = {}
+        
+        # --- Phase 1: Global Scouting ---
+        print(f"\n--- Phase 1: Institutional Scouting ---")
+        for index, row in raw_data.iterrows():
+            search_val = str(row.get(target_col, "")).strip().strip('"')
+            if not search_val or search_val.lower() == "nan":
+                continue
+                
+            print(f"[{index + 1}/{len(raw_data)}] Scouting institution: {search_val}")
+            
+            query_parts = [f'pos(institution:"{search_val}",1)']
+            if search_params['year_range']:
+                query_parts.append(f'pubdate:{format_year(search_params["year_range"])}')
+            base_query = " AND ".join(query_parts)
+            
+            discovery_params = {
+                "q": base_query,
+                "fl": "first_author",
+                "fq": "database:astronomy," + str(search_params['refereed']),
+                "rows": 3000,
+            }
+            url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+            headers = {'Authorization': 'Bearer ' + token}
+            res = make_ads_request(url, headers)
+            
+            if not res or "response" not in res or not res["response"]["docs"]:
+                print(f"  No results. Retrying with affiliation fallback...")
+                fallback_institutions.append(search_val)
+                discovery_params["q"] = base_query.replace(f'pos(institution:"{search_val}",1)', f'pos(aff:"{search_val}",1)')
+                url = f"https://api.adsabs.harvard.edu/v1/search/query?{urlencode(discovery_params)}"
+                res = make_ads_request(url, headers)
+                
+            if res and "response" in res and res["response"]["docs"]:
+                unique_authors = {p.get('first_author') for p in res["response"]["docs"] if p.get('first_author')}
+                for author in unique_authors:
+                    all_unique_authors.add(author)
+                    if author not in author_to_institutions:
+                        author_to_institutions[author] = []
+                    author_to_institutions[author].append(search_val)
+            else:
+                print(f"  Fallback failed. Adding {search_val} to failed searches.")
+                failed_searches.append(search_val)
+                
+        # --- Phase 2: Global Batch Fetching ---
+        new_authors = [a for a in all_unique_authors if a not in AUTHOR_LOOKUP_CACHE]
+        
+        print(f"\n--- Phase 2: Batch Deep Dive Fetching ({len(new_authors)} unique authors globally) ---")
+        all_author_dfs = []
+        author_batches = list(chunk_list(new_authors, BATCH_SIZE))
+        
+        for batch_idx, author_batch in enumerate(author_batches):
+            print(f"Processing batch {batch_idx + 1}/{len(author_batches)} ({len(author_batch)} authors)...")
+            author_sub_query = " OR ".join([f'first_author:"{a}"' for a in author_batch])
+            batch_query = [f"({author_sub_query})"]
+            
+            if search_params['year_range']:
+                batch_query.append(f'pubdate:{format_year(search_params["year_range"])}')
+            batch_query = " AND ".join(batch_query)
+            
+            encoded_batch_query = urlencode({
+                "q": batch_query,
+                "fl": "title, first_author, bibcode, abstract, aff, pubdate, keyword, identifier",
+                "fq": "database:astronomy," + str(search_params['refereed']),
+                "rows": 3000,
+                "sort": "date desc"
+            })
+            
+            df_batch = do_search(None, None, token, encoded_batch_query)
+            if not df_batch.empty:
+                all_author_dfs.append(df_batch)
+                
+            AUTHOR_LOOKUP_CACHE.update(author_batch)
+            
+        if fallback_institutions:
+            print("\n" + "!"*30)
+            print(f"NOTICE: {len(fallback_institutions)} searches returned no institution results and fell back to affiliation.")
+            print(f"Fallback items: {', '.join(fallback_institutions)}")
+            print("!"*30 + "\n")
+            
+            # Optional: Save fallbacks to a CSV for manual inspection
+            pd.DataFrame(fallback_institutions, columns=['Fallback_Institution']).to_csv("fallback_institutions.csv", index=False)
+            
+        if failed_searches:
+            print("\n" + "!"*30)
+            print(f"NOTICE: {len(failed_searches)} searches returned zero results.")
+            print("This usually means the institution name is formatted differently in ADS or the year range is too restrictive.")
+            print(f"Failed items: {', '.join(failed_searches)}")
+            print("!"*30 + "\n")
+            
+        if all_author_dfs:
+            final_df = pd.concat(all_author_dfs, ignore_index=True)
+            def assign_insts(author):
+                insts = author_to_institutions.get(author, [])
+                return ", ".join(insts) if insts else None
+            final_df['Input Institution'] = final_df['First Author'].apply(assign_insts)
+            
+            final_df = process_results(final_df, stop_dir, ec_filter_val)
+            print(f"Search complete. {len(final_df)} unique author records found.")
+            return final_df
+        else:
+            print("No results found.")
+            return pd.DataFrame()
+
+    # --------- 2. Process each row in the CSV (Standard Pattern) --------- 
     for index, row in raw_data.iterrows():
         search_val = str(row.get(target_col, "")).strip().strip('"')
         if not search_val or search_val.lower() == "nan":
@@ -592,7 +850,9 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
             search_args['name'] = None
             search_args['institution'] = search_val
 
-        # Execute search
+        # Execute search without running process_results multiple times
+        search_args['process'] = False
+        search_args['clear_cache'] = False # Relying on cache management inside run_file_search
         result_df = ads_search(**search_args)
     
         if not result_df.empty:
@@ -602,6 +862,15 @@ def run_file_search(filename,  token, stop_dir, year=None, second_auth=False,
 
         time.sleep(ADS_RATE_LIMIT)
     
+    if fallback_institutions:
+        print("\n" + "!"*30)
+        print(f"NOTICE: {len(fallback_institutions)} searches returned no institution results and fell back to affiliation.")
+        print(f"Fallback items: {', '.join(fallback_institutions)}")
+        print("!"*30 + "\n")
+
+        # Optional: Save fallbacks to a CSV for manual inspection
+        pd.DataFrame(fallback_institutions, columns=['Fallback_Institution']).to_csv("fallback_institutions.csv", index=False)
+        
     if failed_searches:
         print("\n" + "!"*30)
         print(f"NOTICE: {len(failed_searches)} searches returned zero results.")
